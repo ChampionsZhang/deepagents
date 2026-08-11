@@ -281,16 +281,21 @@ def test_late_resolved_provider_still_gets_its_retry_config(
         tmp_path,
         "[retries]\nmax_retries = 3\n[retries.openai]\nmax_retries = 10\n",
     )
+    inferred_model = MagicMock(spec=BaseChatModel)
+    inferred_model.profile = None
+    # What `init_chat_model` records after inferring the provider itself.
+    inferred_model._model_provider = "openai"
     model = MagicMock(spec=BaseChatModel)
     model.profile = None
-    # What `init_chat_model` records after inferring the provider itself.
-    model._model_provider = "openai"
     monkeypatch.setattr(model_config, "has_provider_credentials", lambda _: True)
     model_config.clear_caches()
     with (
         patch.object(model_config, "DEFAULT_CONFIG_PATH", cfg),
         patch("deepagents_code.config.detect_provider", return_value=None),
-        patch("langchain.chat_models.init_chat_model", return_value=model),
+        patch(
+            "langchain.chat_models.init_chat_model",
+            side_effect=[inferred_model, model],
+        ) as init,
     ):
         result = create_model("some-unrecognized-model")
     model_config.clear_caches()
@@ -299,6 +304,13 @@ def test_late_resolved_provider_still_gets_its_retry_config(
     # 10 from `[retries.openai]`, not the global 3.
     assert result.model_retries == 10
     assert getattr(model, MODEL_RETRIES_ATTR) == 10
+    # Reconstruct once the provider is known so the OpenAI SDK cannot perform
+    # its default nested retries inside each dcode middleware attempt.
+    assert init.call_count == 2
+    assert init.call_args_list[1].kwargs == {
+        "model_provider": "openai",
+        "max_retries": 0,
+    }
 
 
 @pytest.mark.parametrize("cli_retries", [0, 3])

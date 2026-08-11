@@ -5545,22 +5545,26 @@ def create_model(
     resolved_provider = provider or getattr(model, "_model_provider", provider)
     from deepagents_code.cost_tracking import _set_configured_provider_metadata
 
-    _set_configured_provider_metadata(model, resolved_provider)
-
     if resolved_provider and resolved_provider != provider:
         # A bare model name that `detect_provider` could not place leaves
         # `provider` empty, so the retry lookup above searched for
         # `[retries.""]` and silently fell back to the global count -- the user's
         # `[retries.<provider>]` was discarded. `init_chat_model` has now named
-        # the provider, so redo the lookup and correct the budget. Only the budget
-        # is recoverable here; the SDK retry-disable kwarg had to be decided
-        # before construction, and `_provider_retry_disable_kwargs` already warned
-        # if it could not be applied.
+        # the provider, so redo both the retry lookup and model construction.
+        # The provider SDK normally creates its client in the constructor; merely
+        # changing `kwargs` after the first construction would leave its default
+        # retry loop active and multiply dcode's middleware retry budget.
         model_retries = _resolve_model_retries_from_section(
             retry_section,
             resolved_provider,
             cli_max_retries,
         )
+        kwargs.update(
+            _provider_retry_disable_kwargs(retry_section, resolved_provider, kwargs)
+        )
+        model = _create_model_via_init(model_name, resolved_provider, kwargs)
+
+    _set_configured_provider_metadata(model, resolved_provider)
 
     # Apply profile overrides from config.toml (e.g., max_input_tokens)
     if provider:
