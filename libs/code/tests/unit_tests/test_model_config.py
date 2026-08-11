@@ -8309,3 +8309,66 @@ def test_retry_knob_classification_is_disjoint() -> None:
     from deepagents_code.config import _PROVIDERS_WITHOUT_RETRY_KNOB
 
     assert not _PROVIDERS_WITHOUT_RETRY_KNOB & set(RETRY_PARAM_BY_PROVIDER)
+
+
+class TestDisablePrebuiltModelRetries:
+    """Rebuilding a prebuilt model must not drop caller-supplied runtime state.
+
+    The rebuild goes through `model_dump()`, which omits every field the
+    integration marked `exclude=True` — for most providers that is exactly the
+    caller's transport plumbing (custom `httpx` clients/proxies/mTLS), plus the
+    resolved model `profile` that startup performance depends on.
+    """
+
+    def test_preserves_custom_http_clients(self) -> None:
+        """A caller's proxy/mTLS transport survives the retry-disabling rebuild."""
+        import httpx
+        from langchain_openai import ChatOpenAI
+
+        from deepagents_code.config import disable_prebuilt_model_retries
+
+        sync_transport = httpx.Client()
+        async_transport = httpx.AsyncClient()
+        model = ChatOpenAI(
+            model="gpt-5.5",
+            api_key="test-key",
+            max_retries=3,
+            http_client=sync_transport,
+            http_async_client=async_transport,
+        )
+
+        rebuilt = disable_prebuilt_model_retries(model)
+
+        assert isinstance(rebuilt, ChatOpenAI)
+        assert rebuilt is not model
+        assert rebuilt.max_retries == 0
+        assert rebuilt.http_client is sync_transport
+        assert rebuilt.http_async_client is async_transport
+        # The SDK clients the integration built around those transports must be
+        # the same objects too; otherwise the rebuild would still route calls
+        # through a fresh default-transport client.
+        assert rebuilt.root_client is model.root_client
+        assert rebuilt.client is model.client
+
+    def test_preserves_resolved_profile(self) -> None:
+        """`profile` is excluded from dumps; rebuilding must not recompute it."""
+        from langchain_openai import ChatOpenAI
+
+        from deepagents_code.config import disable_prebuilt_model_retries
+
+        model = ChatOpenAI(model="gpt-5.5", api_key="test-key", max_retries=3)
+        model.profile = {"max_input_tokens": 123}
+
+        rebuilt = disable_prebuilt_model_retries(model)
+
+        assert rebuilt.profile == {"max_input_tokens": 123}
+
+    def test_unknown_provider_returns_model_unchanged(self) -> None:
+        """A provider without a known retry kwarg is never reconstructed."""
+        from langchain_core.language_models.fake_chat_models import FakeListChatModel
+
+        from deepagents_code.config import disable_prebuilt_model_retries
+
+        model = FakeListChatModel(responses=["ok"])
+
+        assert disable_prebuilt_model_retries(model) is model

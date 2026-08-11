@@ -2479,7 +2479,7 @@ def disable_prebuilt_model_retries(model: BaseChatModel) -> BaseChatModel:
     try:
         constructor_kwargs = model.model_dump()
         constructor_kwargs[retry_param] = 0
-        return type(model)(**constructor_kwargs)
+        rebuilt = type(model)(**constructor_kwargs)
     except (AttributeError, TypeError, ValueError):
         # Do not prevent callers from using a valid prebuilt model merely
         # because its integration cannot be reconstructed. The warning makes
@@ -2491,6 +2491,67 @@ def disable_prebuilt_model_retries(model: BaseChatModel) -> BaseChatModel:
             exc_info=True,
         )
         return model
+
+    _restore_excluded_model_fields(
+        source=model, target=rebuilt, retry_param=retry_param
+    )
+    return rebuilt
+
+
+def _restore_excluded_model_fields(
+    *, source: BaseChatModel, target: BaseChatModel, retry_param: str
+) -> None:
+    """Copy serialization-excluded fields from `source` onto `target`.
+
+    `model_dump()` omits fields an integration marks with `exclude=True`, which
+    for most providers covers the caller-supplied runtime plumbing: custom
+    `httpx` clients and transports (`http_client`, `http_async_client`, `client`,
+    `async_client`), callback managers, rate limiters, and the model `profile`.
+    Rebuilding from the dump alone would silently replace a caller's proxy/mTLS
+    transport with fresh default clients, so copy any excluded field that is
+    actually set on the source onto the rebuilt model.
+
+    Fields whose constructor deliberately left them `None` are skipped so
+    lazy-initialized clients on the source do not become frozen on the target.
+    A field that refuses assignment is skipped rather than failing the rebuild;
+    the model still works, just without that one caller customization.
+
+    Restored SDK client objects still carry the source's retry budget, so a
+    copied `root_client`/`client` would keep retrying inside each middleware
+    attempt — the exact nesting the rebuild exists to prevent. Zero the same
+    retry parameter on any restored object that exposes it as a plain
+    attribute. A property without a setter raises `AttributeError` on
+    assignment, which is skipped the same way as a refused field restore.
+    """
+    excluded = [
+        name for name, field in type(source).model_fields.items() if field.exclude
+    ]
+    for name in excluded:
+        try:
+            value = getattr(source, name)
+        except AttributeError:
+            continue
+        if value is None:
+            continue
+        try:
+            setattr(target, name, value)
+        except (AttributeError, TypeError, ValueError):
+            logger.debug(
+                "Could not carry excluded field %r onto rebuilt %s model",
+                name,
+                type(target).__name__,
+            )
+            continue
+        if isinstance(getattr(value, retry_param, None), int):
+            try:
+                setattr(value, retry_param, 0)
+            except (AttributeError, TypeError, ValueError):
+                logger.debug(
+                    "Restored %r on rebuilt %s model still has provider retries "
+                    "enabled; its SDK retries may multiply dcode's retry budget",
+                    name,
+                    type(target).__name__,
+                )
 
 
 CLI_MAX_RETRIES_KEY = "__deepagents_cli_max_retries__"

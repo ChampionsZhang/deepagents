@@ -5373,15 +5373,18 @@ class TestCreateCliAgentInterpreterWiring:
 
     def test_prebuilt_model_disables_provider_sdk_retries(self, tmp_path: Path) -> None:
         """A prebuilt provider model must not multiply dcode's retry budget."""
+        import httpx
         from langchain_openai import ChatOpenAI
 
         mock_settings = self._build_mock_settings(tmp_path)
         mock_agent = Mock()
         mock_agent.with_config.return_value = mock_agent
+        custom_transport = httpx.Client()
         prebuilt_model = ChatOpenAI(
             model="gpt-5.5",
             api_key="test-key",
             max_retries=2,
+            http_client=custom_transport,
         )
 
         with (
@@ -5405,6 +5408,10 @@ class TestCreateCliAgentInterpreterWiring:
         assert normalized_model is not prebuilt_model
         assert normalized_model.max_retries == 0
         assert normalized_model.root_client.max_retries == 0
+        # The rebuild goes through `model_dump()`, which omits caller-supplied
+        # clients; they must be carried over or the caller's proxy/mTLS
+        # transport is silently replaced with a default client.
+        assert normalized_model.http_client is custom_transport
 
     def test_auto_approve_disables_rubric_context_hitl(self, tmp_path: Path) -> None:
         from deepagents.middleware.rubric import RubricMiddleware
