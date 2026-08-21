@@ -198,6 +198,32 @@ def _merge_fs_interrupt_on(
     return merged
 
 
+def _merge_read_only_memory_permissions(
+    read_only_memory: list[str] | None,
+    permissions: list[FilesystemPermission] | None,
+) -> list[FilesystemPermission] | None:
+    """Prepend deny-write rules declared by read-only memory sources.
+
+    Args:
+        read_only_memory: Memory paths whose ownership declaration requires
+            write protection.
+        permissions: Caller-defined filesystem permission rules.
+
+    Returns:
+        Combined rules, or `None` when neither input contains rules.
+    """
+    if not read_only_memory:
+        return list(permissions) if permissions else None
+    return [
+        FilesystemPermission(
+            operations=["write"],
+            paths=list(read_only_memory),
+            mode="deny",
+        ),
+        *(permissions or []),
+    ]
+
+
 def _apply_custom_middleware(
     base: list[AgentMiddleware[Any, Any, Any]],
     custom: Sequence[AgentMiddleware[Any, Any, Any]],
@@ -274,7 +300,7 @@ def create_deep_agent(  # noqa: C901, PLR0912, PLR0915  # Complex graph assembly
     subagents: Sequence[SubAgent | CompiledSubAgent | AsyncSubAgent] | None = None,
     skills: list[str] | None = None,
     memory: list[str] | None = None,
-    writable_memory: list[str] | None = None,
+    read_only_memory: list[str] | None = None,
     permissions: list[FilesystemPermission] | None = None,
     backend: BackendProtocol | None = None,
     interrupt_on: dict[str, bool | InterruptOnConfig] | None = None,
@@ -452,17 +478,24 @@ def create_deep_agent(  # noqa: C901, PLR0912, PLR0915  # Complex graph assembly
             Display names are automatically derived from paths.
 
             Memory is loaded at agent startup and added into the system prompt.
-            These sources are treated as user- or team-owned and read-only to
-            the agent's filesystem tools.
-        writable_memory: List of dedicated agent-generated memory file paths to
-            load after `memory`. These are identified as writable destinations
-            in the memory prompt and are not blocked by `MemoryMiddleware`.
+            These sources retain their existing writable-memory behavior.
+        read_only_memory: List of user- or team-owned instruction files to load
+            before `memory`. Paths must use the same absolute POSIX form required
+            by `FilesystemPermission`.
+
+            `create_deep_agent` labels these sources as read-only in the memory
+            prompt and prepends a deny-write `FilesystemPermission` for the same
+            paths. The generated rule takes precedence over caller-defined
+            permission rules and is inherited by declarative subagents, including
+            the default general-purpose subagent. Pre-compiled subagents retain
+            their own independently configured middleware.
 
             !!! warning
 
-                This ownership split is enforced for the built-in filesystem
-                mutation tools. Custom tools and sandbox commands require their
-                own backend or operating-system access controls.
+                `FilesystemPermission` is enforced by the built-in filesystem
+                tools, not at the backend or operating-system level. Custom tools,
+                direct backend access, and sandbox commands require their own
+                access controls.
         permissions: List of `FilesystemPermission` rules for the main agent
             and its subagents.
 
@@ -637,6 +670,7 @@ def create_deep_agent(  # noqa: C901, PLR0912, PLR0915  # Complex graph assembly
     )
 
     backend = backend if backend is not None else StateBackend()
+    main_permissions = _merge_read_only_memory_permissions(read_only_memory, permissions)
 
     # The built-in tool-usage guidance prose duplicates the tools' own schema
     # descriptions, so the deepagents-owned middleware (filesystem / subagent /
@@ -672,8 +706,12 @@ def create_deep_agent(  # noqa: C901, PLR0912, PLR0915  # Complex graph assembly
             _subagent_spec = raw_subagent_model if isinstance(raw_subagent_model, str) else None
             _subagent_profile = _harness_profile_for_model(subagent_model, _subagent_spec)
 
-            # Resolve permissions: subagent's own rules take priority, else inherit parent's
-            subagent_permissions = spec.get("permissions", permissions)
+            # A subagent's explicit rules replace caller-defined parent rules,
+            # while opt-in read-only memory ownership remains global.
+            subagent_permissions = _merge_read_only_memory_permissions(
+                read_only_memory,
+                spec.get("permissions", permissions),
+            )
 
             # Build middleware: base stack + skills (if specified) + user's middleware
             subagent_middleware: list[AgentMiddleware[Any, Any, Any]] = [
@@ -765,7 +803,7 @@ def create_deep_agent(  # noqa: C901, PLR0912, PLR0915  # Complex graph assembly
             FilesystemMiddleware(
                 backend=backend,
                 custom_tool_descriptions=_profile.tool_description_overrides,
-                _permissions=permissions,
+                _permissions=main_permissions,
             ),
             create_summarization_middleware(model, backend),
             PatchToolCallsMiddleware(),
@@ -817,7 +855,7 @@ def create_deep_agent(  # noqa: C901, PLR0912, PLR0915  # Complex graph assembly
         else:
             general_purpose_spec["system_prompt"] = _apply_profile_prompt(_profile, GENERAL_PURPOSE_SUBAGENT["system_prompt"])
         gp_interrupt_on = _merge_fs_interrupt_on(
-            _build_interrupt_on_from_permissions(permissions or []),
+            _build_interrupt_on_from_permissions(main_permissions or []),
             interrupt_on,
         )
         if gp_interrupt_on is not None:
@@ -833,7 +871,7 @@ def create_deep_agent(  # noqa: C901, PLR0912, PLR0915  # Complex graph assembly
         FilesystemMiddleware(
             backend=backend,
             custom_tool_descriptions=_profile.tool_description_overrides,
-            _permissions=permissions,
+            _permissions=main_permissions,
         )
     )
     sub_agent_middleware: SubAgentMiddleware | None = None
@@ -870,19 +908,19 @@ def create_deep_agent(  # noqa: C901, PLR0912, PLR0915  # Complex graph assembly
     # Anthropic prompt cache prefix.
     deepagent_middleware.extend(_profile.materialize_extra_middleware())
     append_prompt_caching_middleware(deepagent_middleware)
-    if memory is not None or writable_memory is not None:
+    if memory is not None or read_only_memory is not None:
         # MemoryMiddleware applies the cache_control breakpoint only when the
         # request model is Anthropic, making it safe to enable unconditionally.
         deepagent_middleware.append(
             MemoryMiddleware(
                 backend=backend,
                 sources=memory or [],
-                writable_sources=writable_memory,
+                read_only_sources=read_only_memory,
                 add_cache_control=True,
             )
         )
     main_interrupt_on = _merge_fs_interrupt_on(
-        _build_interrupt_on_from_permissions(permissions or []),
+        _build_interrupt_on_from_permissions(main_permissions or []),
         interrupt_on,
     )
     if main_interrupt_on is not None:

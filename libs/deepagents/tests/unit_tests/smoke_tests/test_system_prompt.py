@@ -357,8 +357,8 @@ def test_system_prompt_with_memory_and_skills(snapshots_dir: Path, *, update_sna
     # usage prose does not.
     agent = create_deep_agent(
         model=model,
-        memory=["/memory/AGENTS.md"],
-        writable_memory=["/memory/user/MEMORY.md"],
+        memory=["/memory/user/MEMORY.md"],
+        read_only_memory=["/memory/AGENTS.md"],
         skills=["/skills/user/", "/skills/project/"],
     )
 

@@ -2274,6 +2274,46 @@ class TestSubAgentPermissionsEndToEnd:
         assert "written successfully" in task_result.content
         assert "/workspace/out.txt" in result.get("files", {})
 
+    def test_read_only_memory_applies_to_subagent_with_own_permissions(self) -> None:
+        """Read-only memory ownership is retained when a subagent overrides permissions."""
+        subagent_model = FixedGenericFakeChatModel(
+            messages=iter(
+                [
+                    AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "name": "write_file",
+                                "args": {"file_path": "/instructions/AGENTS.md", "content": "changed"},
+                                "id": "sub_call_1",
+                                "type": "tool_call",
+                            }
+                        ],
+                    ),
+                    AIMessage(content="Error: permission denied for write on /instructions/AGENTS.md"),
+                ]
+            )
+        )
+        worker: SubAgent = {
+            "name": "worker",
+            "description": "A worker subagent.",
+            "system_prompt": "Do work.",
+            "model": subagent_model,
+            "permissions": [],
+        }
+
+        agent = create_deep_agent(
+            model=self._parent_model_calling_subagent(),
+            subagents=[worker],
+            read_only_memory=["/instructions/AGENTS.md"],
+        )
+        result = agent.invoke({"messages": [HumanMessage(content="Delegate the work")]})
+
+        tool_messages = [msg for msg in result["messages"] if msg.type == "tool"]
+        task_result = next(msg for msg in tool_messages if msg.name == "task")
+        assert "permission denied" in task_result.content
+        assert "/instructions/AGENTS.md" not in result.get("files", {})
+
 
 class TestDeepAgentStructure:
     """Test basic deep agent structure without making network calls."""
