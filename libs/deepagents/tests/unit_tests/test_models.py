@@ -25,6 +25,7 @@ from deepagents.profiles import (
     register_harness_profile,
     register_provider_profile,
 )
+from deepagents.profiles.harness._anthropic import _UNIVERSAL_CLAUDE_GUIDANCE
 from deepagents.profiles.harness.harness_profiles import (
     _HARNESS_PROFILES,
     _get_harness_profile,
@@ -1180,19 +1181,84 @@ class TestBuiltInProfiles:
     @pytest.mark.parametrize(
         "model_key",
         [
+            "anthropic:claude-fable-5",
+            "anthropic:claude-mythos-5",
+            "anthropic:claude-opus-5",
+            "anthropic:claude-sonnet-5",
             "anthropic:claude-opus-4-7",
             "anthropic:claude-sonnet-4-6",
             "anthropic:claude-haiku-4-5",
         ],
     )
-    def test_anthropic_latest_models_have_harness_profile(self, model_key: str) -> None:
-        """Each latest Anthropic model registers a non-empty harness profile."""
+    def test_anthropic_built_in_models_have_harness_profile(self, model_key: str) -> None:
+        """Each built-in Anthropic model registers a non-empty harness profile."""
         profile = _get_harness_profile(model_key)
         assert profile is not None
         assert profile.system_prompt_suffix
         assert "<use_parallel_tool_calls>" in profile.system_prompt_suffix
         assert "<investigate_before_answering>" in profile.system_prompt_suffix
         assert "<tool_result_reflection>" in profile.system_prompt_suffix
+
+    def test_fable_5_and_mythos_5_share_supported_model_guidance(self) -> None:
+        """Fable 5 and Mythos 5 share Anthropic's documented steering."""
+        fable = _get_harness_profile("anthropic:claude-fable-5")
+        mythos = _get_harness_profile("anthropic:claude-mythos-5")
+        assert fable is not None
+        assert mythos is not None
+        assert fable.system_prompt_suffix == mythos.system_prompt_suffix
+        assert "<task_scope>" in fable.system_prompt_suffix
+        assert "<progress_grounding>" in fable.system_prompt_suffix
+        assert "<autonomous_completion>" in fable.system_prompt_suffix
+
+    def test_opus_5_has_model_specific_scope_and_delegation_guidance(self) -> None:
+        """Opus 5 gets restraint guidance instead of the Fable overlay."""
+        profile = _get_harness_profile("anthropic:claude-opus-5")
+        assert profile is not None
+        assert "<response_style>" in profile.system_prompt_suffix
+        assert "<task_scope>" in profile.system_prompt_suffix
+        assert "<subagent_usage>" in profile.system_prompt_suffix
+        assert "<progress_grounding>" not in profile.system_prompt_suffix
+        assert "<autonomous_completion>" not in profile.system_prompt_suffix
+
+    def test_sonnet_5_has_literal_scope_guidance(self) -> None:
+        """Sonnet 5 gets its documented literal-instruction overlay."""
+        profile = _get_harness_profile("anthropic:claude-sonnet-5")
+        assert profile is not None
+        assert "<instruction_scope>" in profile.system_prompt_suffix
+        assert "<task_scope>" not in profile.system_prompt_suffix
+        assert "<subagent_usage>" not in profile.system_prompt_suffix
+
+    @pytest.mark.parametrize(
+        "model_key",
+        [
+            "anthropic:claude-fable-5",
+            "anthropic:claude-mythos-5",
+            "anthropic:claude-opus-5",
+            "anthropic:claude-sonnet-5",
+        ],
+    )
+    def test_claude_5_profiles_do_not_change_middleware(self, model_key: str) -> None:
+        """Claude 5 built-ins remain prompt-only profiles."""
+        profile = _get_harness_profile(model_key)
+        assert profile is not None
+        assert not profile.excluded_middleware
+        assert profile.materialize_extra_middleware() == []
+        assert profile.general_purpose_subagent is None
+
+    @pytest.mark.parametrize(
+        "model_key",
+        [
+            # The 5.1 generation has distinct model identifiers and its own
+            # prompting guide, and is explicitly outside this change's scope.
+            "anthropic:claude-fable-5-1",
+            "anthropic:claude-mythos-5-1",
+            # Opus 4.8 is also explicitly outside this change's scope.
+            "anthropic:claude-opus-4-8",
+        ],
+    )
+    def test_claude_5_profiles_are_isolated_to_exact_keys(self, model_key: str) -> None:
+        """Nearby Anthropic identifiers do not inherit an exact model profile."""
+        assert _get_harness_profile(model_key) is None
 
     def test_opus_4_7_suffix_contains_model_specific_overlays(self) -> None:
         """Only Opus 4.7 carries the tool-usage and subagent-usage overlays."""
@@ -1212,28 +1278,41 @@ class TestBuiltInProfiles:
         self,
         model_key: str,
     ) -> None:
-        """Sonnet 4.6 and Haiku 4.5 carry only the universal Claude sections."""
+        """Sonnet 4.6 and Haiku 4.5 carry only the universal Claude sections.
+
+        Asserted as exact equality against the shared universal guidance
+        rather than as absent overlay tags, so adding *any* model-specific
+        text to either module has to be a deliberate edit here.
+        """
         profile = _get_harness_profile(model_key)
         assert profile is not None
-        assert "<tool_usage>" not in profile.system_prompt_suffix
-        assert "<subagent_usage>" not in profile.system_prompt_suffix
+        assert profile.system_prompt_suffix == _UNIVERSAL_CLAUDE_GUIDANCE
 
-    def test_anthropic_universal_sections_are_identical_across_models(self) -> None:
-        """Guard against drift in the duplicated universal prompt sections.
+    @pytest.mark.parametrize(
+        "model_key",
+        [
+            "anthropic:claude-fable-5",
+            "anthropic:claude-mythos-5",
+            "anthropic:claude-opus-5",
+            "anthropic:claude-sonnet-5",
+            "anthropic:claude-opus-4-7",
+            "anthropic:claude-sonnet-4-6",
+            "anthropic:claude-haiku-4-5",
+        ],
+    )
+    def test_anthropic_profiles_start_with_universal_guidance(
+        self,
+        model_key: str,
+    ) -> None:
+        """Every Anthropic profile starts with the shared universal guidance.
 
-        Each Anthropic harness module duplicates the three universal
-        sections verbatim (accepted cost of per-model self-containment);
-        this test asserts they stay in lock-step. If one module updates
-        the text, the others must follow or this test will flag it.
+        This pins both the content and the universal-before-overlay ordering:
+        a module that hand-rolls its own copy of the sections, reorders them,
+        or prepends its overlay fails on that model's own test case.
         """
-        opus = _get_harness_profile("anthropic:claude-opus-4-7")
-        sonnet = _get_harness_profile("anthropic:claude-sonnet-4-6")
-        haiku = _get_harness_profile("anthropic:claude-haiku-4-5")
-        assert opus is not None
-        assert sonnet is not None
-        assert haiku is not None
-        assert opus.system_prompt_suffix.startswith(sonnet.system_prompt_suffix)
-        assert sonnet.system_prompt_suffix == haiku.system_prompt_suffix
+        profile = _get_harness_profile(model_key)
+        assert profile is not None
+        assert profile.system_prompt_suffix.startswith(_UNIVERSAL_CLAUDE_GUIDANCE)
 
     @pytest.mark.parametrize(
         "model_key",
